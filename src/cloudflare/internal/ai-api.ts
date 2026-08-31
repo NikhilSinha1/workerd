@@ -4,6 +4,7 @@
 
 import { AiGateway, type GatewayOptions } from 'cloudflare-internal:aig-api';
 import { AutoRAG } from 'cloudflare-internal:autorag-api';
+import wrappedBinding from 'cloudflare-internal:wrapped-binding';
 import {
   ToMarkdownService,
   type ConversionRequestOptions,
@@ -154,7 +155,7 @@ function findReadableStreamKeys(
   return readableStreamKeys;
 }
 
-export class Ai {
+export class Ai extends wrappedBinding.WrappedBinding {
   #fetcher: Fetcher;
 
   /*
@@ -171,6 +172,7 @@ export class Ai {
   lastRequestInternalStatusCode: number | null = null;
 
   constructor(fetcher: Fetcher) {
+    super(fetcher);
     this.#fetcher = fetcher;
   }
 

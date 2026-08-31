@@ -6,10 +6,22 @@
 
 #include <workerd/api/global-scope.h>
 #include <workerd/io/legacy-hibernation-manager.h>
+#include <workerd/io/limit-enforcer.h>
 #include <workerd/io/tracer.h>
 #include <workerd/jsg/ser.h>
 
 namespace workerd::api {
+
+namespace {
+
+// Hibernatable sockets bypass the regular readLoop (which marks non-hibernatable receives), so we
+// mark the receive here, in-scope, from both the Text and Data dispatch branches. The enforcer
+// captures the timestamp, so this side stays time-agnostic.
+void markHibernatableWebSocketReceive(IoContext& context) {
+  context.getWorker().getIsolate().getLimitEnforcer().markPerfEvent("ws_received"_kjc);
+}
+
+}  // namespace
 
 HibernatableWebSocketEvent::HibernatableWebSocketEvent(): ExtendableEvent("webSocketMessage") {};
 
@@ -28,13 +40,12 @@ HibernatableWebSocketEvent::ItemsForRelease HibernatableWebSocketEvent::prepareF
   // Note that we don't call `claimWebSocket()` to get this, since we would lose our reference to
   // the HibernatableWebSocket (it removes it from `webSocketsForEventHandler`).
   auto websocketRef = hibernatableWebSocket.value->getActiveOrUnhibernate(lock);
-  auto ownedWebSocket = kj::mv(KJ_REQUIRE_NONNULL(hibernatableWebSocket.value->ws));
-  auto tags = hibernatableWebSocket.value->cloneTags();
+  auto tags = hibernatableWebSocket.value->getTags();
 
   // Now that we've obtained the websocket for the event, let's free up the slots we had allocated.
   manager.webSocketsForEventHandler.erase(hibernatableWebSocket);
 
-  return ItemsForRelease(kj::mv(websocketRef), kj::mv(ownedWebSocket), kj::mv(tags));
+  return ItemsForRelease(kj::mv(websocketRef), kj::mv(tags));
 }
 
 jsg::Ref<WebSocket> HibernatableWebSocketEvent::claimWebSocket(
@@ -83,11 +94,12 @@ kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEve
 
   try {
     co_await context.run(
-        [entrypointName = entrypointName, &context, eventParameters = kj::mv(eventParameters),
+        [entrypointName = entrypointName, eventParameters = kj::mv(eventParameters),
             versionInfo = kj::mv(versionInfo), props = kj::mv(props),
-            isDynamicDispatch](Worker::Lock& lock) mutable {
+            isDynamicDispatch](Worker::Lock& lock, IoContext& context) mutable {
       KJ_SWITCH_ONEOF(eventParameters.eventType) {
         KJ_CASE_ONEOF(text, HibernatableSocketParams::Text) {
+          markHibernatableWebSocketReceive(context);
           return lock.getGlobalScope().sendHibernatableWebSocketMessage(context,
               kj::mv(text.message), eventParameters.eventTimeoutMs,
               kj::mv(eventParameters.websocketId), lock,
@@ -95,6 +107,7 @@ kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEve
                   context.getActor(), isDynamicDispatch));
         }
         KJ_CASE_ONEOF(data, HibernatableSocketParams::Data) {
+          markHibernatableWebSocketReceive(context);
           return lock.getGlobalScope().sendHibernatableWebSocketMessage(context,
               kj::mv(data.message), eventParameters.eventTimeoutMs,
               kj::mv(eventParameters.websocketId), lock,
@@ -121,6 +134,8 @@ kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEve
         !jsg::isTunneledException(desc) && !jsg::isDoNotLogException(desc)) {
       LOG_EXCEPTION("HibernatableWebSocketCustomEvent"_kj, e);
     }
+    incomingRequest->getMetrics().reportFailure(e);
+    context.logUncaughtExceptionAsync(UncaughtExceptionSource::ASYNC_TASK, e.clone());
     outcome = EventOutcome::EXCEPTION;
   }
 
@@ -176,9 +191,8 @@ kj::Promise<WorkerInterface::CustomEvent::Result> HibernatableWebSocketCustomEve
 }
 
 HibernatableWebSocketEvent::ItemsForRelease::ItemsForRelease(
-    jsg::Ref<WebSocket> ref, kj::Own<kj::WebSocket> owned, kj::Array<kj::String> tags)
+    jsg::Ref<WebSocket> ref, kj::Array<kj::String> tags)
     : webSocketRef(kj::mv(ref)),
-      ownedWebSocket(kj::mv(owned)),
       tags(kj::mv(tags)) {}
 
 HibernatableWebSocketCustomEvent::HibernatableWebSocketCustomEvent(uint16_t typeId,

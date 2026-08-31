@@ -513,6 +513,9 @@ static constexpr kj::StringPtr ALLOWED_SQLITE_FUNCTIONS[] = {
   "bm25"_kj,
   "snippet"_kj,
 
+  // https://www.sqlite.org/rtree.html
+  "rtreecheck"_kj,
+
   // https://www.sqlite.org/lang_altertable.html
   // Functions declared in https://sqlite.org/src/file?name=src/alter.c&ci=trunk
   "sqlite_rename_column"_kj,
@@ -538,6 +541,11 @@ struct PragmaInfo {
 // We allowlist these SQLite pragmas (for read only, never with arguments).
 // https://www.sqlite.org/pragma.html
 static constexpr PragmaInfo ALLOWED_PRAGMAS[] = {{"data_version"_kj, PragmaSignature::NO_ARG},
+
+  // The R*Tree module issues `PRAGMA page_size` (with no argument) internally to read the current
+  // page size. `PRAGMA page_size=N`, which would attempt to change the page size, is still
+  // rejected.
+  {"page_size"_kj, PragmaSignature::NO_ARG},
 
   // We allowlist some SQLite pragmas for changing internal state
 
@@ -591,6 +599,12 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
 
   auto memoryScope = enterMemoryScope();
 
+  // sqlite3_close_v2 is expected to be called even when sqlite3_open_v2 returns an error. It is
+  // expected that sqlite3_close_v2 sets up a database in need of close, or sets nullptr.
+  // sqlite3_close_v2 is safe to call on nullptr, so we should simply call this always, thus
+  // cleaning up a partial db even when SQLITE_CALL_NODB throws.
+  KJ_ON_SCOPE_FAILURE(sqlite3_close_v2(db));
+
   KJ_IF_SOME(mode, maybeMode) {
     int flags = SQLITE_OPEN_READWRITE;
     if (kj::has(mode, kj::WriteMode::CREATE)) {
@@ -624,8 +638,6 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
           sqlite3_open_v2(path.toString().cStr(), &db, SQLITE_OPEN_READONLY, vfs.getName().cStr()));
     }
   }
-
-  KJ_ON_SCOPE_FAILURE(sqlite3_close_v2(db));
 
   setupSecurity(db);
 
@@ -1290,12 +1302,17 @@ bool SqliteDatabase::isAuthorized(int actionCode,
     case SQLITE_CREATE_VTABLE: /* Table Name      Module Name     */
     case SQLITE_DROP_VTABLE:   /* Table Name      Module Name     */
       // Virtual tables are tables backed by some native-code callbacks.
-      // We don't support these except for FTS5 (Full Text Search) https://www.sqlite.org/fts5.html
-      // (Which also includes fts5vocab: "[fts5vocab] is available whenever FTS5 is")
+      // We don't support these except for:
+      // - FTS5 (Full Text Search) https://www.sqlite.org/fts5.html
+      //   (Which also includes fts5vocab: "[fts5vocab] is available whenever FTS5 is")
+      // - RTREE (spatial index) https://www.sqlite.org/rtree.html
+      //   (Which also includes rtree_i32, the 32-bit-integer-coordinate variant)
       {
         KJ_IF_SOME(moduleName, param2) {
           if (strcasecmp(moduleName.begin(), "fts5") == 0 ||
-              strcasecmp(moduleName.begin(), "fts5vocab") == 0) {
+              strcasecmp(moduleName.begin(), "fts5vocab") == 0 ||
+              strcasecmp(moduleName.begin(), "rtree") == 0 ||
+              strcasecmp(moduleName.begin(), "rtree_i32") == 0) {
             return regulator->isAllowedName(KJ_ASSERT_NONNULL(param1));
           }
         }
@@ -1356,13 +1373,9 @@ void SqliteDatabase::setupSecurity(sqlite3* db) {
   SQLITE_CALL_NODB(sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr));
 
   // 2. Reduce limits
-  // We use the suggested limits from the web site. Note that sqlite3_limit() does NOT return an
-  // error code; it returns the old limit.
-
-  // This limit is set higher than what is suggested on sqlite.org/security.html
-  // because we want to allow storing values of 1MiB, and we added some extra
-  // padding on top of that
-  sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 2200000);
+  // We use most of the suggested limits from sqlite.org/security.html. Note that sqlite3_limit()
+  // does NOT return an error code; it returns the old limit.
+  sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 4 * 1024 * 1024);
   sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, 100000);
   sqlite3_limit(db, SQLITE_LIMIT_COLUMN, 100);
   sqlite3_limit(db, SQLITE_LIMIT_EXPR_DEPTH, 100);
